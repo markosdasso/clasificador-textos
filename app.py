@@ -38,7 +38,7 @@ def limpiar_texto(df):
 
 
 def validar_dataset(df):
-
+        
     df = limpiar_textos_entrada(df)
 
     posibles_etiquetas = ["etiquetas", "labels", "categoria", "tag", "tags"]
@@ -55,6 +55,9 @@ def validar_dataset(df):
     df["etiquetas"] = df["etiquetas"].astype(str).str.strip()
     df = df[df["etiquetas"] != ""]
 
+    if "origen" not in df.columns:
+            df["origen"] = "modelo"
+            
     return df.drop_duplicates("texto").reset_index(drop=True)
 
 
@@ -165,7 +168,12 @@ def predecir_topk(modelo, mlb, texto, threshold=0.3, top_k=3):
         for i in top_idx
     ]
 
-    return etiquetas, sugerencias, float(probs.max())
+    probs_dict = {
+        mlb.classes_[i]: float(probs[i])
+        for i in range(len(probs))
+    }   
+
+    return etiquetas, sugerencias, float(probs.max()), probs_dict
 
 
 def predecir_similitud(df, texto):
@@ -238,7 +246,7 @@ if st.button("Clasificar"):
         pred, conf = predecir_similitud(st.session_state.dataset, texto)
         sugerencias = []
     else:
-        pred, sugerencias, conf = predecir_topk(modelo, mlb, texto, threshold)
+        pred, sugerencias, conf, probs = predecir_topk(modelo, mlb, texto, threshold)
 
     st.write("### Resultado")
     st.write(pred, conf)
@@ -258,7 +266,7 @@ if archivo_lote:
     try:
         df_lote = pd.read_csv(archivo_lote, sep=";") if archivo_lote.name.endswith(".csv") else pd.read_excel(archivo_lote)
 
-        # 🔥 limpieza robusta
+        # limpieza
         df_lote = limpiar_textos_entrada(df_lote)
 
         st.write("Columnas detectadas:", df_lote.columns.tolist())
@@ -276,29 +284,70 @@ if archivo_lote:
             resultados = []
             errores = []
 
-            for i, t in enumerate(df_lote["texto"]):
+            total = len(df_lote)
+            # métricas
+            conf_acum = 0
+            low_conf_count = 0
+            label_counter = {}
 
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            metric_text = st.empty()
+
+            for i, t in enumerate(df_lote["texto"]):
+            
                 try:
                     t = str(t)
-
+            
                     if tipo == "Similitud":
                         pred, conf = predecir_similitud(st.session_state.dataset, t)
+                        probs = {}
                     else:
-                        pred, _, conf = predecir_topk(modelo, mlb, t, threshold)
-
+                        pred, sugerencias, conf, probs = predecir_topk(modelo, mlb, t, threshold)
+            
                     resultados.append({
                         "texto": t,
                         "etiquetas": "|".join(pred),
-                        "confianza": conf
+                        "confianza": conf,
+                        "origen": "modelo",
+                        "probs": "|".join([f"{k}:{round(v,3)}" for k,v in probs.items()]) if probs else ""
                     })
-
+                    # métricas
+                    conf_acum += conf
+                    
+                    if conf < threshold:
+                        low_conf_count += 1
+                    
+                    for label in pred:
+                        label_counter[label] = label_counter.get(label, 0) + 1
+            
                 except Exception as e:
                     errores.append({
                         "fila": i,
                         "texto": str(t),
                         "error": str(e)
                     })
+            
+                # 🔥 actualizar progreso
+                if i % 10 == 0 or i == total - 1:
 
+                    progress = int((i + 1) / total * 100)
+                    progress_bar.progress(progress)
+                
+                    status_text.text(f"Procesando: {i+1}/{total} ({progress}%)")
+                
+                    # métricas
+                    avg_conf = conf_acum / (i + 1)
+                    low_conf_pct = (low_conf_count / (i + 1)) * 100
+                
+                    top_labels = sorted(label_counter.items(), key=lambda x: x[1], reverse=True)[:3]
+                    top_labels_str = ", ".join([f"{k} ({v})" for k,v in top_labels])
+                
+                    metric_text.text(
+                        f"Conf promedio: {round(avg_conf,3)} | "
+                        f"Baja confianza: {round(low_conf_pct,1)}% | "
+                        f"Top etiquetas: {top_labels_str}"
+                    )
             st.session_state.lote = pd.DataFrame(resultados)
 
             st.success(f"Lote procesado: {len(resultados)} ok / {len(errores)} errores")
@@ -309,7 +358,6 @@ if archivo_lote:
 
     except Exception as e:
         st.error(f"Error al cargar lote: {e}")
-
 # -------------------------
 # CORRECCIÓN INTELIGENTE
 # -------------------------
@@ -327,7 +375,7 @@ if not st.session_state.lote.empty:
         texto_corr = df_baja.loc[fila, "texto"]
 
         modelo, mlb = obtener_modelo(st.session_state.dataset)
-        _, sugerencias, _ = predecir_topk(modelo, mlb, texto_corr, threshold)
+        _, sugerencias, _, _ = predecir_topk(modelo, mlb, texto_corr, threshold)
 
         st.write("### 🤖 Sugerencias")
         for e, s in sugerencias:
@@ -372,8 +420,9 @@ if not st.session_state.lote.empty:
 
             nuevo = pd.DataFrame([{
                 "texto": texto_corr,
-                "etiquetas": "|".join(seleccion)
-    }])
+                "etiquetas": "|".join(seleccion),
+                "origen": "manual"
+            }])
 
         # guardar en dataset
             st.session_state.dataset = pd.concat(
@@ -387,6 +436,7 @@ if not st.session_state.lote.empty:
     # 🔥 actualizar lote en pantalla
             st.session_state.lote.at[fila, "etiquetas"] = "|".join(seleccion)
             st.session_state.lote.at[fila, "confianza"] = 1.0
+            st.session_state.lote.at[fila, "origen"] = "manual"
 
     # limpiar UI
             st.session_state.pop("input_nueva_etiqueta", None)
@@ -410,3 +460,12 @@ if not st.session_state.lote.empty:
 
 if st.button("Reset"):
     st.session_state.clear()
+   
+# -------------------------
+# BOTON DESCARGA DATASET ENTRENADO
+# -------------------------
+st.download_button(
+    "📥 Descargar dataset entrenado",
+    to_excel(st.session_state.dataset),
+    "dataset_entrenado.xlsx"
+)
